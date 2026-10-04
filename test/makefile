@@ -5,7 +5,7 @@ SRCS     := $(wildcard *.cpp)
 OBJS     := $(SRCS:.cpp=.o)
 TARGET   := test.bin
 
-.PHONY: all clean
+.PHONY: all clean run
 
 all: $(TARGET)
 
@@ -17,3 +17,6 @@ $(TARGET): $(OBJS)
 
 clean:
 	rm -f $(TARGET) $(OBJS)
+
+run: $(TARGET)
+	./test.bin

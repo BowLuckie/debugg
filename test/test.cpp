@@ -1,6 +1,10 @@
-#include <iostream>
 
+#include <iostream>
 int main() {
-  std::cerr << "Hello World!\n";
+  long a = 3;
+  long b = 2;
+  long c = a + b;
+  std::cout << c << '\n';
+  a = 4;
   return 0;
 }

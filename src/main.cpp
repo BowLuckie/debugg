@@ -1,3 +1,6 @@
+#include "data.hh"
+#include "dwarf++.hh"
+#include "elf++.hh"
 #include "linenoise.h"
 #include <algorithm>
 #include <array>
@@ -5,14 +8,18 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
+#include <fstream>
 #include <iomanip>
 #include <ios>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <sys/personality.h>
 #include <sys/ptrace.h>
+#include <sys/siginfo.h>
 #include <sys/types.h>
 #include <sys/user.h>
 #include <sys/wait.h>
@@ -110,7 +117,7 @@ public:
   void disable();
 
   intptr_t is_enabled() { return m_enabled; }
-  intptr_t get_address() { return m_addr; }
+  intptr_t get_addr() { return m_addr; }
 
 private:
   pid_t m_pid;
@@ -122,14 +129,20 @@ private:
 class debugger {
 public:
   debugger(string prog_name, pid_t pid)
-      : m_prog_name{std::move(prog_name)}, m_pid{pid} {}
+      : m_prog_name{std::move(prog_name)}, m_pid{pid} {
+    int fd = open(m_prog_name.c_str(), O_RDONLY);
+
+    m_elf = elf::elf{elf::create_mmap_loader(fd)};
+    m_dwarf = dwarf::dwarf{dwarf::elf::create_loader(m_elf)};
+  }
+
   ~debugger();
 
   void run();
   void continue_execution();
   void handle_command(const string& line);
 
-  void wait_for_signal();
+  void wait_for_signal(bool verbose);
 
   void dump_registers();
   uint64_t read_memory(intptr_t addr);
@@ -141,10 +154,24 @@ public:
   uint64_t get_pc();
   void set_pc(uint64_t addr);
 
+  void initialize_load_addr();
+  uint64_t offset_load_addr(uint64_t);
+
+  std::optional<dwarf::die> get_pc_function_die(uint64_t pc);
+  std::optional<dwarf::line_table::iterator>
+  get_line_entry_from_pc(uint64_t pc);
+
+  void print_source(const string& file_name,
+                    unsigned line,
+                    unsigned n_lines_context);
+
 private:
   string m_prog_name;
   pid_t m_pid;
   std::unordered_map<intptr_t, breakpoint> m_breakpoints;
+  dwarf::dwarf m_dwarf;
+  elf::elf m_elf;
+  uint64_t m_load_addr;
 };
 bool is_prefix(const std::string& s, const std::string& of) {
   if (s.size() > of.size()) return false;
@@ -154,7 +181,7 @@ bool is_prefix(const std::string& s, const std::string& of) {
 vector<string> split(const string& s, char delimiter) {
   vector<string> out{};
   std::stringstream ss{s};
-  std::string item;
+  string item;
 
   while (std::getline(ss, item, delimiter)) {
     out.push_back(item);
@@ -197,9 +224,8 @@ int main(int argc, char* argv[]) {
 }
 
 void debugger::run() {
-  int wait_status;
-  int options = 0;
-  waitpid(m_pid, &wait_status, options);
+  wait_for_signal(false);
+  initialize_load_addr();
 
   char* line = nullptr;
   while ((line = linenoise("mdeb> ")) != nullptr) {
@@ -316,29 +342,31 @@ static std::string signal_name(int sig) {
          std::to_string(sig); // realtime signals etc. have no abbrev
 }
 
-void debugger::wait_for_signal() {
+void debugger::wait_for_signal(bool verbose) {
   int wait_status;
   auto options = 0;
   waitpid(m_pid, &wait_status, options);
 
-  if (WIFEXITED(wait_status)) {
-    std::cerr << color::aqua << "[mdeb] exited with "
-              << WEXITSTATUS(wait_status) << color::reset << '\n';
-  } else if (WIFSTOPPED(wait_status)) {
-    std::cerr << color::yellow << "[mdeb] stopped by "
-              << signal_name(WSTOPSIG(wait_status)) << " at rip=0x" << std::hex
-              << get_register_value(m_pid, reg::rip) << std::dec << color::reset
-              << '\n';
-  } else if (WIFSIGNALED(wait_status)) {
-    std::cerr << color::red << "[mdeb] killed by "
-              << signal_name(WTERMSIG(wait_status)) << color::reset << '\n';
+  if (verbose) {
+    if (WIFEXITED(wait_status)) {
+      std::cerr << color::aqua << "[mdeb] exited with "
+                << WEXITSTATUS(wait_status) << color::reset << '\n';
+    } else if (WIFSTOPPED(wait_status)) {
+      std::cerr << color::yellow << "[mdeb] stopped by "
+                << signal_name(WSTOPSIG(wait_status)) << " at rip=0x"
+                << std::hex << get_register_value(m_pid, reg::rip) << std::dec
+                << color::reset << '\n';
+    } else if (WIFSIGNALED(wait_status)) {
+      std::cerr << color::red << "[mdeb] killed by "
+                << signal_name(WTERMSIG(wait_status)) << color::reset << '\n';
+    }
   }
 }
 
 void debugger::continue_execution() {
   step_over_break();
   ptrace(PTRACE_CONT, m_pid, nullptr, nullptr);
-  wait_for_signal();
+  wait_for_signal(true);
 }
 
 void breakpoint::enable() {
@@ -403,3 +431,83 @@ uint64_t debugger::get_pc() { return get_register_value(m_pid, reg::rip); }
 void debugger::set_pc(uint64_t val) {
   set_register_value(m_pid, reg::rip, val);
 }
+
+std::optional<dwarf::die> debugger::get_pc_function_die(uint64_t pc) {
+  for (auto& cu : m_dwarf.compilation_units()) {
+    if (dwarf::die_pc_range(cu.root()).contains(pc)) {
+      for (const auto& die : cu.root()) {
+        if (die.tag == dwarf::DW_TAG::subprogram) {
+          if (dwarf::die_pc_range(die).contains(pc)) {
+            return die;
+          }
+        }
+      }
+    }
+  }
+
+  return std::nullopt;
+}
+
+std::optional<dwarf::line_table::iterator>
+debugger::get_line_entry_from_pc(uint64_t pc) {
+  for (auto& cu : m_dwarf.compilation_units()) {
+    if (dwarf::die_pc_range(cu.root()).contains(pc)) {
+      auto& lt = cu.get_line_table();
+      auto it = lt.find_address(pc);
+      if (it == lt.end()) {
+        return std::nullopt;
+      } else {
+        return it;
+      }
+    }
+  }
+
+  return std::nullopt;
+}
+
+void debugger::initialize_load_addr() {
+  if (m_elf.get_hdr().type == elf::et::dyn) {
+    std::ifstream map("/proc/" + std::to_string(m_pid) + "/maps");
+
+    string addr;
+    std::getline(map, addr, '-');
+
+    m_load_addr = std::stol(addr, 0, 16);
+  }
+}
+
+uint64_t debugger::offset_load_addr(uint64_t addr) {
+  return addr - m_load_addr;
+}
+
+void debugger::print_source(const string& file_name,
+                            unsigned line,
+                            unsigned n_lines_context) {
+  std::ifstream file{file_name};
+
+  auto start_line = line <= n_lines_context ? 1 : line - n_lines_context;
+  auto end_line = line + n_lines_context +
+                  (line < n_lines_context ? n_lines_context - line : 0) + 1;
+
+  char c{};
+  unsigned current_line = 1;
+  while (current_line != start_line && file.get(c)) {
+    if (c == '\n') {
+      ++current_line;
+    }
+  }
+
+  cerr << (current_line == line ? "> " : " ");
+
+  while (current_line <= end_line && file.get(c)) {
+    cerr << c;
+    if (c == '\n') {
+      ++current_line;
+      cerr << (current_line == line ? "> " : " ");
+    }
+  }
+
+  cerr << '\n';
+}
+
+siginfo_t debugger::get_signal_info() {}
