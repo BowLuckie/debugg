@@ -1,10 +1,8 @@
-
 #include <iostream>
+
 int main() {
-  long a = 3;
-  long b = 2;
-  long c = a + b;
-  std::cout << c << '\n';
-  a = 4;
+  int* ptr = nullptr;
+  std::cout << *ptr << std::endl;
+
   return 0;
 }

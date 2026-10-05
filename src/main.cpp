@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <csignal>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -14,12 +15,13 @@
 #include <ios>
 #include <iostream>
 #include <optional>
+#include <ostream>
+#include <signal.h>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <sys/personality.h>
 #include <sys/ptrace.h>
-#include <sys/siginfo.h>
 #include <sys/types.h>
 #include <sys/user.h>
 #include <sys/wait.h>
@@ -35,8 +37,6 @@ using std::vector;
 
 namespace color {
 constexpr const char* reset = "\033[0m";
-constexpr const char* red = "\033[31m";
-constexpr const char* yellow = "\033[33m";
 constexpr const char* aqua = "\033[36m";
 } // namespace color
 
@@ -142,7 +142,7 @@ public:
   void continue_execution();
   void handle_command(const string& line);
 
-  void wait_for_signal(bool verbose);
+  void wait_for_signal();
 
   void dump_registers();
   uint64_t read_memory(intptr_t addr);
@@ -150,6 +150,7 @@ public:
 
   void set_break_addr(intptr_t addr);
   void step_over_break();
+  void handle_sigtrap(siginfo_t siginfo);
 
   uint64_t get_pc();
   void set_pc(uint64_t addr);
@@ -164,6 +165,11 @@ public:
   void print_source(const string& file_name,
                     unsigned line,
                     unsigned n_lines_context);
+
+  siginfo_t get_signal_info();
+
+  void single_step_instruction();
+  void signle_step_checked();
 
 private:
   string m_prog_name;
@@ -224,7 +230,7 @@ int main(int argc, char* argv[]) {
 }
 
 void debugger::run() {
-  wait_for_signal(false);
+  wait_for_signal();
   initialize_load_addr();
 
   char* line = nullptr;
@@ -334,39 +340,30 @@ void debugger::handle_command(const std::string& line) {
   }
 }
 
-static std::string signal_name(int sig) {
-  if (const char* abbrev = sigabbrev_np(sig)) {
-    return std::string("SIG") + abbrev; // "SIGTRAP"
-  }
-  return "signal " +
-         std::to_string(sig); // realtime signals etc. have no abbrev
-}
-
-void debugger::wait_for_signal(bool verbose) {
+void debugger::wait_for_signal() {
   int wait_status;
   auto options = 0;
   waitpid(m_pid, &wait_status, options);
 
-  if (verbose) {
-    if (WIFEXITED(wait_status)) {
-      std::cerr << color::aqua << "[mdeb] exited with "
-                << WEXITSTATUS(wait_status) << color::reset << '\n';
-    } else if (WIFSTOPPED(wait_status)) {
-      std::cerr << color::yellow << "[mdeb] stopped by "
-                << signal_name(WSTOPSIG(wait_status)) << " at rip=0x"
-                << std::hex << get_register_value(m_pid, reg::rip) << std::dec
-                << color::reset << '\n';
-    } else if (WIFSIGNALED(wait_status)) {
-      std::cerr << color::red << "[mdeb] killed by "
-                << signal_name(WTERMSIG(wait_status)) << color::reset << '\n';
-    }
+  siginfo_t siginfo = get_signal_info();
+  switch (siginfo.si_signo) {
+  case SIGTRAP:
+    handle_sigtrap(siginfo);
+    break;
+
+  case SIGSEGV:
+    cerr << "*** segmentation fault *** program " << m_pid << " reason "
+         << siginfo.si_code << '\n';
+
+  default:
+    cerr << "*** signal recived *** " << strsignal(siginfo.si_signo) << '\n';
   }
 }
 
 void debugger::continue_execution() {
   step_over_break();
   ptrace(PTRACE_CONT, m_pid, nullptr, nullptr);
-  wait_for_signal(true);
+  wait_for_signal();
 }
 
 void breakpoint::enable() {
@@ -395,20 +392,16 @@ void debugger::set_break_addr(intptr_t addr) {
 }
 
 void debugger::step_over_break() {
-  // rip is at one address past the possible break
-  uint64_t maybe_break_addr = get_pc() - 1;
-
-  auto it = m_breakpoints.find(maybe_break_addr);
-  if (it == m_breakpoints.end() || !it->second.is_enabled()) return;
+  auto it = m_breakpoints.find(get_pc());
+  if (it == m_breakpoints.end()) return;
 
   auto& bp = it->second;
-  set_pc(maybe_break_addr);
-
-  bp.disable();
-  ptrace(PTRACE_SINGLESTEP, m_pid, nullptr, nullptr);
-  int status;
-  waitpid(m_pid, &status, 0);
-  if (WIFSTOPPED(status)) bp.enable();
+  if (bp.is_enabled()) {
+    bp.disable();
+    ptrace(PTRACE_SINGLESTEP, m_pid, nullptr, nullptr);
+    wait_for_signal();
+    bp.enable();
+  }
 }
 
 debugger::~debugger() {
@@ -510,4 +503,62 @@ void debugger::print_source(const string& file_name,
   cerr << '\n';
 }
 
-siginfo_t debugger::get_signal_info() {}
+siginfo_t debugger::get_signal_info() {
+  siginfo_t info;
+  ptrace(PTRACE_GETSIGINFO, m_pid, nullptr, &info);
+  return info;
+}
+
+void debugger::handle_sigtrap(siginfo_t siginfo) {
+  switch (siginfo.si_code) {
+  case SI_KERNEL:
+  case TRAP_BRKPT: {
+    set_pc(get_pc() - 1);
+    cerr << "*** hit breakpoint *** address 0x" << std::hex << get_pc()
+         << std::dec << '\n';
+
+    uint64_t offset_pc = offset_load_addr(get_pc());
+
+    std::optional<dwarf::line_table::iterator> line_entry;
+    try {
+      line_entry = get_line_entry_from_pc(offset_pc);
+    } catch (const std::out_of_range&) {
+      cerr << "dwarf info unavailable";
+    }
+
+    if (line_entry) {
+      auto& le = *line_entry;
+      print_source(le->file->path, le->line, 8);
+    } else {
+      cerr << "    (no source info for this address)\n";
+    }
+    return;
+  }
+
+  case TRAP_TRACE:
+  case SI_USER:
+    return;
+
+  case TRAP_HWBKPT:
+    cerr << "*** hardware trap *** address 0x" << std::hex << get_pc()
+         << std::dec << '\n';
+    return;
+
+  default:
+    cerr << "*** unknown sigtrap code *** code " << siginfo.si_code << '\n';
+    return;
+  }
+}
+
+void debugger::single_step_instruction() {
+  ptrace(PTRACE_SINGLESTEP, m_pid, nullptr, nullptr);
+  wait_for_signal();
+}
+
+void debugger::signle_step_checked() {
+  if (m_breakpoints.count(get_pc())) {
+    step_over_break();
+  } else {
+    single_step_instruction();
+  }
+}

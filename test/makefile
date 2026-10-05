@@ -1,5 +1,5 @@
 CXX      := g++
-CXXFLAGS := -Wall -Wextra -std=c++17 -g $(EXTRA_CXXFLAGS)
+CXXFLAGS := -Wall -Wextra -std=c++17 -g -gdwarf-4 $(EXTRA_CXXFLAGS)
 
 SRCS     := $(wildcard *.cpp)
 OBJS     := $(SRCS:.cpp=.o)
